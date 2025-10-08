@@ -1,0 +1,12 @@
+[project]
+name = "moshi-data-generation"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12, <3.13"
+dependencies = [
+    "numpy==1.26.4",
+    "openai>=2.2.0",
+    "pydub>=0.25.1",
+    "style-bert-vits2>=2.5.0",
+]
