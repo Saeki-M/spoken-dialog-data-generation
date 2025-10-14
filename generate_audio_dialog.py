@@ -20,7 +20,7 @@ from pydub import AudioSegment
 from tts import Vits
 
 # ---------------------- CONFIG ---------------------- #
-INPUT_DIR = Path("./output/transcript/")  # directory containing .tsv files
+INPUT_DIR = Path("./output/text/")  # directory containing .tsv files
 OUTPUT_DIR = Path("./output/audio/")  # where .wav files will be written
 GLOB_PATTERN = "*.tsv"  # which TSVs to process
 OVERWRITE = True  # set False to skip if output exists

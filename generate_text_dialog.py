@@ -160,7 +160,7 @@ def main():
         "--turns", type=int, default=20, help="1対話あたりの発話数（初期値: 20）"
     )
     parser.add_argument(
-        "--outdir", type=str, default="outputs_tsv", help="出力ディレクトリ"
+        "--outdir", type=str, default="output/text", help="出力ディレクトリ"
     )
     args = parser.parse_args()
 
