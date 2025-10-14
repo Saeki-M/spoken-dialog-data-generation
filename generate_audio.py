@@ -2,12 +2,12 @@
 # -*- coding: utf-8 -*-
 
 """
-TSV -> Simulated Conversation (Style-BERT-VITS2), Stereo Mix (frame-precise)
+Folder TSVs -> Stereo Conversation WAVs (frame-precise, robust)
 
 - assistant -> LEFT channel
 - user      -> RIGHT channel
 - Unknown roles fall back to assistant/LEFT
-- Single output: <OUTPUT_DIR>/<TSV_STEM>.wav
+- For each TSV in INPUT_DIR, output <OUTPUT_DIR>/<tsv_stem>.wav
 """
 
 import csv
@@ -17,30 +17,34 @@ from typing import Dict, List, Tuple
 
 from pydub import AudioSegment
 
-from tts import Vits  # <-- change to your actual import path
+from tts import Vits
 
 # ---------------------- CONFIG ---------------------- #
-TSV_PATH = Path("outputs_tsv/dialog_0007_QA.tsv")  # <-- point to your TSV
-OUTPUT_DIR = Path("./tts_out")
+INPUT_DIR = Path("./output/transcript/")  # directory containing .tsv files
+OUTPUT_DIR = Path("./output/audio/")  # where .wav files will be written
+GLOB_PATTERN = "*.tsv"  # which TSVs to process
+OVERWRITE = True  # set False to skip if output exists
+
 INTER_TURN_SILENCE_MS = 400
 NORMALIZE_TARGET_DBFS = -16.0
-
-CONVERSATION_WAV = OUTPUT_DIR / f"{TSV_PATH.stem}.wav"
 
 # One canonical audio format for everything
 TARGET_FRAME_RATE = 24000
 TARGET_SAMPLE_WIDTH = 2  # 16-bit
 TARGET_CHANNELS = 1  # mono per side
 
+# Role -> voice dir under ./vits_model/<voice>
 voices: Dict[str, str] = {
     "assistant": "azusa",
     "user": "youtube2",
 }
 
+# Optional: strip content in parentheses?
 REMOVE_PARENS = False
 # ---------------------------------------------------- #
 
 
+# ---------------------- I/O & Text ---------------------- #
 def read_tsv(path: Path) -> List[dict]:
     rows = []
     with path.open("r", encoding="utf-8") as f:
@@ -58,6 +62,7 @@ def prepare_text(s: str) -> str:
     return s
 
 
+# ---------------------- Audio Utils ---------------------- #
 def normalize(segment: AudioSegment, target_dbfs: float) -> AudioSegment:
     change = target_dbfs - segment.dBFS if segment.dBFS != float("-inf") else 0.0
     return segment.apply_gain(change)
@@ -81,7 +86,6 @@ def silent_frames(n_frames: int) -> AudioSegment:
             .set_channels(1)
         )
     num_bytes = n_frames * TARGET_SAMPLE_WIDTH * TARGET_CHANNELS
-    # Construct raw PCM silence
     return AudioSegment(
         data=b"\x00" * num_bytes,
         sample_width=TARGET_SAMPLE_WIDTH,
@@ -94,6 +98,22 @@ def ms_to_frames(ms: int) -> int:
     return int(round((ms / 1000.0) * TARGET_FRAME_RATE))
 
 
+def equalize_frames(
+    left: AudioSegment, right: AudioSegment
+) -> tuple[AudioSegment, AudioSegment]:
+    """Pad the shorter side with exact frames of silence to match lengths."""
+    lf = int(round(left.frame_count()))
+    rf = int(round(right.frame_count()))
+    if lf == rf:
+        return left, right
+    if lf < rf:
+        left += silent_frames(rf - lf)
+    else:
+        right += silent_frames(lf - rf)
+    return left, right
+
+
+# ---------------------- TTS Engines ---------------------- #
 def build_tts_engines(voices_map: Dict[str, str]) -> Dict[str, Vits]:
     engines: Dict[str, Vits] = {}
     missing: List[Tuple[str, str]] = []
@@ -113,21 +133,7 @@ def build_tts_engines(voices_map: Dict[str, str]) -> Dict[str, Vits]:
     return engines
 
 
-def equalize_frames(
-    left: AudioSegment, right: AudioSegment
-) -> tuple[AudioSegment, AudioSegment]:
-    """Pad the shorter side with exact frames of silence to match lengths."""
-    lf = int(round(left.frame_count()))
-    rf = int(round(right.frame_count()))
-    if lf == rf:
-        return left, right
-    if lf < rf:
-        left += silent_frames(rf - lf)
-    else:
-        right += silent_frames(lf - rf)
-    return left, right
-
-
+# ---------------------- Core Synth ---------------------- #
 def synthesize_stereo_conversation(
     rows: List[dict], engines: Dict[str, Vits]
 ) -> AudioSegment:
@@ -159,7 +165,6 @@ def synthesize_stereo_conversation(
         )
         seg = to_target_format(normalize(seg, NORMALIZE_TARGET_DBFS))
 
-        # Inter-turn gap (exact frames) added to BOTH channels equally
         if not is_first:
             gap = silent_frames(gap_frames)
             left_track += gap
@@ -179,25 +184,57 @@ def synthesize_stereo_conversation(
     left_track, right_track = equalize_frames(left_track, right_track)
 
     # Combine into stereo
-    stereo = AudioSegment.from_mono_audiosegments(left_track, right_track)
-    return stereo
+    return AudioSegment.from_mono_audiosegments(left_track, right_track)
+
+
+# ---------------------- Batch Driver ---------------------- #
+def process_one_tsv(tsv_path: Path, engines: Dict[str, Vits]) -> Path:
+    rows = read_tsv(tsv_path)
+    if not rows:
+        raise ValueError(f"No rows in TSV: {tsv_path}")
+
+    stereo_mix = synthesize_stereo_conversation(rows, engines)
+
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    out_path = OUTPUT_DIR / f"{tsv_path.stem}.wav"
+
+    if out_path.exists() and not OVERWRITE:
+        print(f"⏭️  Skipping (exists): {out_path}")
+        return out_path
+
+    stereo_mix.export(out_path, format="wav")
+    print(f"✅ Wrote: {out_path}")
+    return out_path
 
 
 def main():
-    if not TSV_PATH.exists():
-        raise FileNotFoundError(f"TSV not found: {TSV_PATH}")
+    if not INPUT_DIR.exists():
+        raise FileNotFoundError(f"Input folder not found: {INPUT_DIR}")
 
-    rows = read_tsv(TSV_PATH)
-    if not rows:
-        raise ValueError("No rows found in TSV.")
+    tsvs = sorted(INPUT_DIR.glob(GLOB_PATTERN))
+    if not tsvs:
+        raise FileNotFoundError(f"No TSVs matched {GLOB_PATTERN} under {INPUT_DIR}")
 
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    print(f"Found {len(tsvs)} TSV(s) in {INPUT_DIR}")
 
+    # Build engines once and reuse for all files
     engines = build_tts_engines(voices)
-    stereo_mix = synthesize_stereo_conversation(rows, engines)
 
-    stereo_mix.export(CONVERSATION_WAV, format="wav")
-    print(f"✅ Done.\n- Conversation: {CONVERSATION_WAV}")
+    errors = []
+    for i, tsv in enumerate(tsvs, start=1):
+        print(f"[{i}/{len(tsvs)}] Processing {tsv.name} ...")
+        try:
+            process_one_tsv(tsv, engines)
+        except Exception as e:
+            errors.append((tsv, e))
+            print(f"❌ Error: {tsv} -> {e}")
+
+    if errors:
+        print("\nCompleted with errors on these files:")
+        for p, e in errors:
+            print(f"- {p}: {e}")
+    else:
+        print("\n🎉 All TSVs processed successfully.")
 
 
 if __name__ == "__main__":
