@@ -35,7 +35,7 @@ TARGET_CHANNELS = 1  # mono per side
 
 # Role -> voice dir under ./vits_model/<voice>
 voices: Dict[str, str] = {
-    "assistant": "azusa",
+    "assistant": "youtube1",
     "user": "youtube2",
 }
 
