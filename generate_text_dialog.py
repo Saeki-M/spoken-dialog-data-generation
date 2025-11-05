@@ -3,6 +3,7 @@ import csv
 import json
 import random
 import re
+import time
 from datetime import datetime
 from pathlib import Path
 
@@ -76,50 +77,71 @@ def build_prompt(task_type: str, target_turns: int = 20) -> str:
 
 # ===== モデル呼び出し =====
 def generate_dialog(
-    task_type: str, model: str = "gpt-oss:20b", turns: int = 20
+    task_type: str, model: str = "gpt-oss:20b", turns: int = 20, max_retries: int = 3
 ) -> list[dict]:
     prompt = build_prompt(task_type, turns)
-    resp = client.chat.completions.create(
-        model=model,
-        messages=[
-            {
-                "role": "system",
-                "content": "You are a helpful Japanese-speaking assistant that generates high-quality simulated dialogues (JSON array only).",
-            },
-            {"role": "user", "content": prompt},
-        ],
-        temperature=0.9,
-        max_tokens=4096,
-    )
 
-    content = resp.choices[0].message.content
+    for attempt in range(max_retries + 1):
+        try:
+            resp = client.chat.completions.create(
+                model=model,
+                messages=[
+                    {
+                        "role": "system",
+                        "content": "You are a helpful Japanese-speaking assistant that generates high-quality simulated dialogues (JSON array only).",
+                    },
+                    {"role": "user", "content": prompt},
+                ],
+                temperature=0.9,
+                max_tokens=4096,
+            )
 
-    try:
-        data = json.loads(content)
-    except json.JSONDecodeError:
-        import re
+            content = resp.choices[0].message.content
 
-        content_clean = re.sub(
-            r"^```(?:json)?|```$", "", content.strip(), flags=re.MULTILINE
-        )
-        data = json.loads(content_clean)
+            try:
+                data = json.loads(content)
+            except json.JSONDecodeError:
+                content_clean = re.sub(
+                    r"^```(?:json)?|```$", "", content.strip(), flags=re.MULTILINE
+                )
+                data = json.loads(content_clean)
 
-    fixed = []
-    for m in data:
-        if not isinstance(m, dict):
-            continue
-        role = m.get("role")
-        text = m.get("content")
-        if role in ("assistant", "user") and isinstance(text, str) and text.strip():
-            fixed.append({"role": role, "content": text.strip()})
+            fixed = []
+            for m in data:
+                if not isinstance(m, dict):
+                    continue
+                role = m.get("role")
+                text = m.get("content")
+                if (
+                    role in ("assistant", "user")
+                    and isinstance(text, str)
+                    and text.strip()
+                ):
+                    fixed.append({"role": role, "content": text.strip()})
 
-    # 👇 ここを変更：
-    # 不足分を強制的に埋めない。生成された分だけ使う。
-    # 必要なら turns 上限で切り捨て。
-    if len(fixed) > turns:
-        fixed = fixed[:turns]
+            if len(fixed) > turns:
+                fixed = fixed[:turns]
 
-    return fixed
+            if not fixed:  # Empty dialog, retry
+                raise ValueError("Generated empty dialog")
+
+            return fixed
+
+        except (json.JSONDecodeError, ValueError) as e:
+            if attempt < max_retries:
+                wait_time = (2**attempt) + random.uniform(0, 1)  # Exponential backoff
+                print(
+                    f"⚠️  JSON parse failed (attempt {attempt + 1}/{max_retries + 1}): {e}"
+                )
+                print(f"   Retrying in {wait_time:.1f} seconds...")
+                time.sleep(wait_time)
+            else:
+                print(
+                    f"❌ Failed to generate valid dialog after {max_retries + 1} attempts"
+                )
+                raise
+
+    return []  # Should never reach here
 
 
 # ===== TSV保存 =====
@@ -144,12 +166,32 @@ def save_dialog_as_tsv(
             writer.writerow(row)
 
 
+# ===== 最後に生成されたファイルを見つけて開始番号を決定 =====
+def find_last_dialog_index(out_dir: Path) -> int:
+    """Find the highest dialog index in existing files and return next index to use."""
+    if not out_dir.exists():
+        return 1
+
+    max_index = 0
+    pattern = re.compile(r"dialog_(\d+)_.*\.tsv")
+
+    for file_path in out_dir.glob("dialog_*.tsv"):
+        match = pattern.match(file_path.name)
+        if match:
+            index = int(match.group(1))
+            max_index = max(max_index, index)
+
+    return max_index + 1
+
+
 # ===== メイン =====
 def main():
     parser = argparse.ArgumentParser(
         description="Generate n simulated dialogues and save each as TSV."
     )
-    parser.add_argument("--n", type=int, default=1, help="生成する対話数（初期値: 1）")
+    parser.add_argument(
+        "--n", type=int, default=10000, help="生成する対話数（初期値: 1）"
+    )
     parser.add_argument(
         "--model",
         type=str,
@@ -162,33 +204,52 @@ def main():
     parser.add_argument(
         "--outdir", type=str, default="output/text", help="出力ディレクトリ"
     )
+    parser.add_argument(
+        "--max-retries", type=int, default=3, help="JSON parse失敗時の最大リトライ回数"
+    )
     args = parser.parse_args()
 
     out_dir = Path(args.outdir)
     now = datetime.now().strftime("%Y%m%d_%H%M%S")
 
-    for i in range(1, args.n + 1):
+    # 最後に生成されたファイルから開始番号を決定
+    start_index = find_last_dialog_index(out_dir)
+    end_index = start_index + args.n - 1
+
+    print(f"📁 Output directory: {out_dir}")
+    print(f"🔢 Continuing from index {start_index} to {end_index}")
+
+    for i in range(start_index, end_index + 1):
         # ランダムにタスクタイプを選択
         task_type = random.choice(TASK_TYPES)
 
-        # 生成
-        dialog = generate_dialog(
-            task_type=task_type, model=args.model, turns=args.turns
-        )
+        try:
+            # 生成
+            dialog = generate_dialog(
+                task_type=task_type,
+                model=args.model,
+                turns=args.turns,
+                max_retries=args.max_retries,
+            )
 
-        # メタ情報
-        meta = {
-            "seed_like": str(random.randint(0, 2**31 - 1)),
-            "timestamp": now,
-            "model": args.model,
-        }
+            # メタ情報
+            meta = {
+                "seed_like": str(random.randint(0, 2**31 - 1)),
+                "timestamp": now,
+                "model": args.model,
+            }
 
-        # ファイル名: 連番 + タスクタイプスラッグ
-        slug = re.sub(r"[^a-zA-Z0-9]+", "_", task_type).strip("_")
-        fname = f"dialog_{i:04d}_{slug}.tsv"
-        save_dialog_as_tsv(dialog, out_dir / fname, task_type, meta=meta)
+            # ファイル名: 連番 + タスクタイプスラッグ
+            slug = re.sub(r"[^a-zA-Z0-9]+", "_", task_type).strip("_")
+            fname = f"dialog_{i:04d}_{slug}.tsv"
+            save_dialog_as_tsv(dialog, out_dir / fname, task_type, meta=meta)
 
-        print(f"✅ Saved: {out_dir / fname}  (task_type={task_type})")
+            print(f"✅ Saved: {out_dir / fname}  (task_type={task_type})")
+
+        except Exception as e:
+            print(f"❌ Failed to generate dialog {i}: {e}")
+            print("   Skipping to next dialog...")
+            continue
 
 
 if __name__ == "__main__":

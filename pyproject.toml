@@ -9,4 +9,5 @@ dependencies = [
     "openai>=2.2.0",
     "pydub>=0.25.1",
     "style-bert-vits2>=2.5.0",
+    "whisperx>=3.3.1",
 ]

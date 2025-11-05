@@ -23,7 +23,7 @@ from tts import Vits
 INPUT_DIR = Path("./output/text/")  # directory containing .tsv files
 OUTPUT_DIR = Path("./output/audio/")  # where .wav files will be written
 GLOB_PATTERN = "*.tsv"  # which TSVs to process
-OVERWRITE = True  # set False to skip if output exists
+OVERWRITE = False  # set False to skip if output exists
 
 INTER_TURN_SILENCE_MS = 400
 NORMALIZE_TARGET_DBFS = -16.0
@@ -35,7 +35,7 @@ TARGET_CHANNELS = 1  # mono per side
 
 # Role -> voice dir under ./vits_model/<voice>
 voices: Dict[str, str] = {
-    "assistant": "youtube1",
+    "assistant": "azusa",
     "user": "youtube2",
 }
 
@@ -198,10 +198,6 @@ def process_one_tsv(tsv_path: Path, engines: Dict[str, Vits]) -> Path:
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     out_path = OUTPUT_DIR / f"{tsv_path.stem}.wav"
 
-    if out_path.exists() and not OVERWRITE:
-        print(f"⏭️  Skipping (exists): {out_path}")
-        return out_path
-
     stereo_mix.export(out_path, format="wav")
     print(f"✅ Wrote: {out_path}")
     return out_path
@@ -220,9 +216,19 @@ def main():
     # Build engines once and reuse for all files
     engines = build_tts_engines(voices)
 
+    # Ensure output directory exists
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
     errors = []
     for i, tsv in enumerate(tsvs, start=1):
         print(f"[{i}/{len(tsvs)}] Processing {tsv.name} ...")
+
+        # Check if output already exists and skip if OVERWRITE is False
+        out_path = OUTPUT_DIR / f"{tsv.stem}.wav"
+        if out_path.exists() and not OVERWRITE:
+            print(f"⏭️  Skipping (exists): {out_path}")
+            continue
+
         try:
             process_one_tsv(tsv, engines)
         except Exception as e:
