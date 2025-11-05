@@ -1,11 +1,15 @@
 import io
 from pathlib import Path
 
+import style_bert_vits2
+import style_bert_vits2.logging
 import torch
 from pydub import AudioSegment
 from style_bert_vits2.constants import Languages
 from style_bert_vits2.nlp import bert_models
 from style_bert_vits2.tts_model import TTSModel
+
+style_bert_vits2.logging.logger.remove()
 
 
 class Vits:

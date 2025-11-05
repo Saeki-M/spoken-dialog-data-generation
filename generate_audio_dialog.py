@@ -2,18 +2,22 @@
 # -*- coding: utf-8 -*-
 
 """
-Folder TSVs -> Stereo Conversation WAVs (frame-precise, robust)
+Folder TSVs -> Stereo Conversation WAVs (+ world-time transcript JSON)
 
-- assistant -> LEFT channel
-- user      -> RIGHT channel
+- assistant -> LEFT channel (speaker "A")
+- user      -> RIGHT channel (speaker "B")
 - Unknown roles fall back to assistant/LEFT
-- For each TSV in INPUT_DIR, output <OUTPUT_DIR>/<tsv_stem>.wav
+
+Outputs per TSV:
+  - <OUTPUT_DIR>/<stem>.wav  (stereo)
+  - <OUTPUT_DIR>/<stem>.json (array of {speaker, word, start, end}, sorted by start)
 """
 
 import csv
+import json
 import re
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Any, Dict, List, Tuple
 
 from pydub import AudioSegment
 
@@ -21,9 +25,10 @@ from tts import Vits
 
 # ---------------------- CONFIG ---------------------- #
 INPUT_DIR = Path("./output/text/")  # directory containing .tsv files
-OUTPUT_DIR = Path("./output/audio/")  # where .wav files will be written
-GLOB_PATTERN = "*.tsv"  # which TSVs to process
-OVERWRITE = False  # set False to skip if output exists
+OUTPUT_DIR = Path("./output/audio/")  # where .wav/.json will be written
+TIMESTAMP_DIR = Path("./output/timestamps/")
+GLOB_PATTERN = "*.tsv"
+OVERWRITE = False
 
 INTER_TURN_SILENCE_MS = 400
 NORMALIZE_TARGET_DBFS = -16.0
@@ -38,6 +43,18 @@ voices: Dict[str, str] = {
     "assistant": "azusa",
     "user": "youtube2",
 }
+
+# Speaker label mapping for JSON
+SPEAKER_LABEL: Dict[str, str] = {
+    "assistant": "A",
+    "user": "B",
+}
+
+# For alignment
+ALIGN_LANGUAGE = "ja"  # e.g., "ja", "en"
+ALIGN_OUTPUT_UNIT = "char"  # "word" or "char"  (your example uses characters)
+JSON_WORD_KEY = "word"  # keep key name as "word" even for char output, to match example
+ROUND_MS = 3  # JSON time precision (e.g., 3 => milliseconds)
 
 # Optional: strip content in parentheses?
 REMOVE_PARENS = False
@@ -133,10 +150,103 @@ def build_tts_engines(voices_map: Dict[str, str]) -> Dict[str, Vits]:
     return engines
 
 
-# ---------------------- Core Synth ---------------------- #
-def synthesize_stereo_conversation(
+# ---------------------- Alignment (WhisperX) ---------------------- #
+def _seg_to_numpy_16k(seg: AudioSegment):
+    """Convert a pydub AudioSegment to mono 16k float32 NumPy array in [-1, 1]."""
+    import numpy as np
+
+    # ensure mono first (should already be)
+    seg = seg.set_channels(1)
+    # resample to 16k for aligner
+    seg16 = seg.set_frame_rate(16_000)
+    # get raw samples as ints
+    samples = seg16.get_array_of_samples()
+    np_int = np.array(samples)  # dtype usually int16
+    # scale to float32 in [-1,1]
+    if seg16.sample_width == 2:
+        np_float = (np_int.astype("float32") / 32768.0).clip(-1.0, 1.0)
+    else:
+        # generic fallback
+        max_abs = float(1 << (8 * seg16.sample_width - 1))
+        np_float = (np_int.astype("float32") / max_abs).clip(-1.0, 1.0)
+    return np_float, 16_000
+
+
+class Aligner:
+    """Lazy-initialized WhisperX aligner."""
+
+    _loaded = False
+    _align_model = None
+    _meta = None
+    _device = "cuda:0"
+
+    @classmethod
+    def ensure_loaded(cls, language_code: str):
+        if cls._loaded:
+            return
+        try:
+            import torch
+            import whisperx
+
+            cls._device = "cuda:0" if torch.cuda.is_available() else "cpu"
+            cls._align_model, cls._meta = whisperx.load_align_model(
+                language_code=language_code, device=cls._device
+            )
+            cls._loaded = True
+        except Exception as e:
+            raise RuntimeError(
+                f"WhisperX alignment unavailable: {e}\n"
+                "Install: pip install whisperx torch torchaudio --extra-index-url https://download.pytorch.org/whl/cu124  (or CPU wheels)"
+            )
+
+    @classmethod
+    def align_segment(
+        cls, seg: AudioSegment, text: str, unit: str = "word"
+    ) -> List[Dict[str, Any]]:
+        """
+        Returns list of {label, start, end} with times relative to the start of seg.
+        unit: "word" or "char"
+        """
+        import whisperx
+
+        if not text.strip():
+            return []
+
+        cls.ensure_loaded(ALIGN_LANGUAGE)
+        audio_np, _ = _seg_to_numpy_16k(seg)
+
+        # Wrap as a single "segment" for whisperx
+        segments = [
+            {"start": 0.0, "end": max(0.02, len(audio_np) / 16_000.0), "text": text}
+        ]
+
+        aligned = whisperx.align(
+            segments,
+            cls._align_model,
+            cls._meta,
+            audio_np,
+            cls._device,
+            (unit == "char"),
+        )
+
+        out: List[Dict[str, Any]] = []
+
+        for word_timestamp in aligned["word_segments"]:
+            if "start" in word_timestamp:
+                out.append(
+                    {
+                        "label": word_timestamp["word"],
+                        "start": float(word_timestamp["start"]),
+                        "end": float(word_timestamp["end"]),
+                    }
+                )
+        return out
+
+
+# ---------------------- Core Synth + JSON ---------------------- #
+def synthesize_stereo_conversation_and_words(
     rows: List[dict], engines: Dict[str, Vits]
-) -> AudioSegment:
+) -> Tuple[AudioSegment, List[Dict[str, Any]]]:
     # Sort by turn_index if present
     try:
         rows = sorted(rows, key=lambda r: int(r["turn_index"]))
@@ -148,6 +258,10 @@ def synthesize_stereo_conversation(
     left_track = silent_frames(0)
     right_track = silent_frames(0)
     is_first = True
+
+    # We advance a global timeline by appending to both tracks in lockstep.
+    # Global offset (in frames) is simply current length of the tracks.
+    items_world: List[Dict[str, Any]] = []
 
     for r in rows:
         role = (r.get("role") or "").strip()
@@ -165,14 +279,33 @@ def synthesize_stereo_conversation(
         )
         seg = to_target_format(normalize(seg, NORMALIZE_TARGET_DBFS))
 
+        # Insert inter-turn gap (both channels) except before the very first segment
         if not is_first:
             gap = silent_frames(gap_frames)
             left_track += gap
             right_track += gap
         is_first = False
 
-        seg_frames = int(round(seg.frame_count()))
+        # Compute global start offset (in seconds) BEFORE adding this segment
+        # Current length (frames) is same for left and right because we always add in lockstep
+        current_frames = int(round(left_track.frame_count()))
+        global_offset_sec = current_frames / float(TARGET_FRAME_RATE)
 
+        # Alignment (relative to seg) -> convert to world time
+        aligned_local = Aligner.align_segment(seg, text, unit=ALIGN_OUTPUT_UNIT)
+        speaker = SPEAKER_LABEL.get(role, SPEAKER_LABEL.get("assistant", "A"))
+        for w in aligned_local:
+            items_world.append(
+                {
+                    "speaker": speaker,
+                    JSON_WORD_KEY: w["label"],
+                    "start": round(global_offset_sec + w["start"], ROUND_MS),
+                    "end": round(global_offset_sec + w["end"], ROUND_MS),
+                }
+            )
+
+        # Add audio to the appropriate channel
+        seg_frames = int(round(seg.frame_count()))
         if role == "user":
             left_track += silent_frames(seg_frames)
             right_track += seg
@@ -183,24 +316,38 @@ def synthesize_stereo_conversation(
     # Final safety equalization by exact frame count
     left_track, right_track = equalize_frames(left_track, right_track)
 
+    # Sort word/char items by world start time
+    items_world.sort(key=lambda x: (x["start"], x["end"]))
+
     # Combine into stereo
-    return AudioSegment.from_mono_audiosegments(left_track, right_track)
+    stereo = AudioSegment.from_mono_audiosegments(left_track, right_track)
+    return stereo, items_world
 
 
 # ---------------------- Batch Driver ---------------------- #
-def process_one_tsv(tsv_path: Path, engines: Dict[str, Vits]) -> Path:
+def process_one_tsv(
+    tsv_path: Path, engines: Dict[str, Vits]
+) -> Tuple[Path, Path | None]:
     rows = read_tsv(tsv_path)
     if not rows:
         raise ValueError(f"No rows in TSV: {tsv_path}")
 
-    stereo_mix = synthesize_stereo_conversation(rows, engines)
+    stereo_mix, items_world = synthesize_stereo_conversation_and_words(rows, engines)
 
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    out_path = OUTPUT_DIR / f"{tsv_path.stem}.wav"
+    TIMESTAMP_DIR.mkdir(parents=True, exist_ok=True)
+    wav_path = OUTPUT_DIR / f"{tsv_path.stem}.wav"
+    json_path = TIMESTAMP_DIR / f"{tsv_path.stem}.json"
 
-    stereo_mix.export(out_path, format="wav")
-    print(f"✅ Wrote: {out_path}")
-    return out_path
+    stereo_mix.export(wav_path, format="wav")
+
+    if items_world:
+        json_text = json.dumps(items_world, ensure_ascii=False, indent=2)
+        json_path.write_text(json_text, encoding="utf-8")
+        return wav_path, json_path
+    else:
+        print("⚠️  No alignment JSON produced (alignment disabled or failed).")
+        return wav_path, None
 
 
 def main():
@@ -223,10 +370,11 @@ def main():
     for i, tsv in enumerate(tsvs, start=1):
         print(f"[{i}/{len(tsvs)}] Processing {tsv.name} ...")
 
-        # Check if output already exists and skip if OVERWRITE is False
-        out_path = OUTPUT_DIR / f"{tsv.stem}.wav"
-        if out_path.exists() and not OVERWRITE:
-            print(f"⏭️  Skipping (exists): {out_path}")
+        # Skip if output exists and not overwriting (skip both wav/json if wav exists)
+        out_wav = OUTPUT_DIR / f"{tsv.stem}.wav"
+        out_json = TIMESTAMP_DIR / f"{tsv.stem}.json"
+        if out_wav.exists() and out_json.exists() and not OVERWRITE:
+            print(f"⏭️  Skipping (exists): {out_wav}")
             continue
 
         try:

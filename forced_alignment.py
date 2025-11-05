@@ -1,175 +1,97 @@
-#!/usr/bin/env python3
-# align_jp.py
-"""
-Minimal forced-alignment CLI for WAV + transcript -> JSON word timings.
-
-Requirements (install one-time):
-    pip install whisperx torch
-
-Example:
-    python align_jp.py --wav /path/audio.wav --text "今日はいい天気ですね"
-    python align_jp.py --wav /path/audio.wav --text-file /path/text.txt --out out.json
-
-Notes:
-- Defaults to Japanese ('ja'). Works on CPU or CUDA automatically.
-- Output JSON (stdout or --out) is a list of items:
-    [{"word": "...", "start": 0.12, "end": 0.30, "score": 0.91}]
-"""
-
 import argparse
 import json
-import os
-import sys
-import unicodedata
-import wave
-from contextlib import closing
+from pathlib import Path
+from typing import Any, Dict, List
 
 import torch
-import whisperx  # type: ignore
+import torchaudio
 
 
-def get_device():
-    if torch.cuda.is_available():
-        return "cuda"
-    return "cpu"
-
-
-def wav_duration_seconds(wav_path: str) -> float:
-    """Read WAV duration using stdlib 'wave' (PCM WAV recommended)."""
-    with closing(wave.open(wav_path, "rb")) as wf:
-        frames = wf.getnframes()
-        rate = wf.getframerate()
-        if rate == 0:
-            return 0.0
-        return round(frames / float(rate), 6)
-
-
-def normalize_text_jp(s: str) -> str:
-    """
-    Light normalization similar to user's pipeline:
-    - lower-case (mostly impacts latin)
-    - convert full-width ASCII to half-width
-    - strip surrounding whitespace
-    (Avoid aggressive token/space changes for Japanese.)
-    """
-    s = s.strip().lower()
-    # Convert full-width ASCII/punctuation to half-width
-    s = unicodedata.normalize("NFKC", s)
-    return s
-
-
-def load_align_model(language_code: str, device: str, model_name: str | None):
-    """
-    WhisperX align model loader with a safe fallback if model_name is unsupported.
-    """
-    if model_name:
-        try:
-            return whisperx.load_align_model(
-                language_code=language_code, device=device, model_name=model_name
-            )
-        except TypeError:
-            # Older whisperx versions may not accept model_name kwarg
-            pass
-        except Exception:
-            # If the requested model_name fails, fall back
-            pass
-    # Fallback to default model for the language
-    return whisperx.load_align_model(language_code=language_code, device=device)
-
-
-def run_align(wav_path: str, text: str, lang: str, device: str, model_name: str | None):
-    # Prepare single segment spanning the full file
-    dur = wav_duration_seconds(wav_path)
-    if dur <= 0:
-        raise ValueError(
-            "Could not read a valid duration from WAV. Ensure it's a standard PCM WAV file."
-        )
-    segs = [
-        {
-            "text": normalize_text_jp(text) if lang == "ja" else text.strip(),
-            "start": 0.0,
-            "end": float(dur),
-        }
-    ]
-
-    model_a, metadata = load_align_model(lang, device, model_name)
-
-    # Perform alignment
-    # whisperx.align returns a dict with "word_segments" among other things
-    aligned = whisperx.align(segs, model_a, metadata, wav_path, device)
-
-    # Build a compact list of word timings
-    out = []
-    for w in aligned.get("word_segments", []):
-        # Some versions may include additional keys; we just keep the essentials
-        word = w.get("word")
-        start = w.get("start")
-        end = w.get("end")
-        score = w.get("score")
-        if word is None or start is None or end is None:
-            continue
-        out.append(
-            {
-                "word": word,
-                "start": float(start),
-                "end": float(end),
-                "score": float(score) if score is not None else None,
-            }
-        )
-    return out
+def load_audio_mono_16k(
+    path: Path, target_sr: int = 16_000
+) -> tuple[torch.Tensor, int, float]:
+    wav, sr = torchaudio.load(str(path))  # (C, T), float32 in [-1,1]
+    if wav.shape[0] > 1:
+        wav = wav.mean(0, keepdim=True)  # mono
+    if sr != target_sr:
+        wav = torchaudio.functional.resample(wav, sr, target_sr)
+        sr = target_sr
+    duration = wav.shape[-1] / float(sr)
+    return wav.cpu(), sr, duration
 
 
 def main():
-    ap = argparse.ArgumentParser(
-        description="Forced alignment (WAV + text) -> JSON word timings."
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--wav", required=True, type=Path, help="Path to WAV file")
+    ap.add_argument("--text", required=True, help="Reference text to align")
+    ap.add_argument(
+        "--lang", default="ja", help="Language code for align model (e.g., ja, en)"
     )
     ap.add_argument(
-        "--wav", required=True, help="Path to input WAV file (PCM WAV recommended)."
-    )
-    g = ap.add_mutually_exclusive_group(required=True)
-    g.add_argument("--text", help="Transcript text (string).")
-    g.add_argument("--text-file", help="Path to a UTF-8 text file with transcript.")
-    ap.add_argument(
-        "--lang", default="ja", help="Language code for the align model (default: ja)."
+        "--device", default="cuda:0" if torch.cuda.is_available() else "cpu"
     )
     ap.add_argument(
-        "--model-name",
-        default=None,
-        help="Optional specific align model name (e.g., reazon-research/japanese-wav2vec2-large-rs35kh).",
+        "--chars", action="store_true", help="Output character-level timings"
     )
-    ap.add_argument("--out", default=None, help="Output JSON path (default: stdout).")
+    ap.add_argument(
+        "--out", type=Path, help="Write JSON to this path (default: stdout)"
+    )
     args = ap.parse_args()
 
-    if not os.path.isfile(args.wav):
-        ap.error(f"--wav not found: {args.wav}")
+    wav, sr, dur = load_audio_mono_16k(args.wav, 16_000)  # (1, T), 16 kHz
+    audio_np = wav.squeeze(0).numpy()
 
-    if args.text_file:
-        if not os.path.isfile(args.text_file):
-            ap.error(f"--text-file not found: {args.text_file}")
-        with open(args.text_file, "r", encoding="utf-8") as f:
-            transcript = f.read().strip()
-    else:
-        transcript = (args.text or "").strip()
+    import whisperx
 
-    if not transcript:
-        ap.error("Transcript is empty. Provide --text or --text-file with content.")
+    align_model, meta = whisperx.load_align_model(
+        language_code=args.lang, device=args.device
+    )
 
-    device = get_device()
-    try:
-        result = run_align(args.wav, transcript, args.lang, device, args.model_name)
-    except Exception as e:
-        print(f"Alignment failed: {e}", file=sys.stderr)
-        sys.exit(2)
+    segments = [{"start": 0.0, "end": max(0.02, dur), "text": args.text}]
 
+    aligned = whisperx.align(
+        segments,
+        align_model,
+        meta,
+        audio_np,
+        args.device,
+        args.chars,
+    )
+
+    unit_key = "chars" if args.chars else "words"
+    label_key = "char" if args.chars else "word"
+
+    items: List[Dict[str, Any]] = []
+    for seg in aligned.get("segments", []):
+        for w in seg.get(unit_key, []):
+            if w.get("start") is None or w.get("end") is None:
+                continue
+            item = {
+                label_key: w.get(label_key, ""),
+                "start": float(w["start"]),
+                "end": float(w["end"]),
+            }
+            if "score" in w and w["score"] is not None:
+                item["score"] = float(w["score"])
+            items.append(item)
+
+    items.sort(key=lambda x: x["start"])
+
+    out = {
+        "audio_path": str(args.wav),
+        "language": args.lang,
+        "sample_rate": sr,
+        "duration": dur,
+        "unit": "char" if args.chars else "word",
+        "items": items,
+    }
+
+    text = json.dumps(out, ensure_ascii=False, indent=2)
     if args.out:
-        os.makedirs(os.path.dirname(args.out), exist_ok=True) if os.path.dirname(
-            args.out
-        ) else None
-        with open(args.out, "w", encoding="utf-8") as fp:
-            json.dump(result, fp, ensure_ascii=False, indent=2)
+        args.out.parent.mkdir(parents=True, exist_ok=True)
+        args.out.write_text(text, encoding="utf-8")
     else:
-        json.dump(result, sys.stdout, ensure_ascii=False, indent=2)
-        print()
+        print(text)
 
 
 if __name__ == "__main__":
