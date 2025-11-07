@@ -1,18 +1,3 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-
-"""
-Folder TSVs -> Stereo Conversation WAVs (+ world-time transcript JSON)
-
-- assistant -> LEFT channel (speaker "A")
-- user      -> RIGHT channel (speaker "B")
-- Unknown roles fall back to assistant/LEFT
-
-Outputs per TSV:
-  - <OUTPUT_DIR>/<stem>.wav  (stereo)
-  - <OUTPUT_DIR>/<stem>.json (array of {speaker, word, start, end}, sorted by start)
-"""
-
 import csv
 import json
 import re
@@ -40,7 +25,7 @@ TARGET_CHANNELS = 1  # mono per side
 
 # Role -> voice dir under ./vits_model/<voice>
 voices: Dict[str, str] = {
-    "assistant": "azusa",
+    "assistant": "youtube1",
     "user": "youtube2",
 }
 
@@ -336,18 +321,18 @@ def process_one_tsv(
 
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     TIMESTAMP_DIR.mkdir(parents=True, exist_ok=True)
-    wav_path = OUTPUT_DIR / f"{tsv_path.stem}.wav"
+    aac_path = OUTPUT_DIR / f"{tsv_path.stem}.mp3"
     json_path = TIMESTAMP_DIR / f"{tsv_path.stem}.json"
 
-    stereo_mix.export(wav_path, format="wav")
+    stereo_mix.export(aac_path, format="mp3")
 
     if items_world:
         json_text = json.dumps(items_world, ensure_ascii=False, indent=2)
         json_path.write_text(json_text, encoding="utf-8")
-        return wav_path, json_path
+        return aac_path, json_path
     else:
         print("⚠️  No alignment JSON produced (alignment disabled or failed).")
-        return wav_path, None
+        return aac_path, None
 
 
 def main():
@@ -370,11 +355,10 @@ def main():
     for i, tsv in enumerate(tsvs, start=1):
         print(f"[{i}/{len(tsvs)}] Processing {tsv.name} ...")
 
-        # Skip if output exists and not overwriting (skip both wav/json if wav exists)
-        out_wav = OUTPUT_DIR / f"{tsv.stem}.wav"
+        out_audio = OUTPUT_DIR / f"{tsv.stem}.mp3"
         out_json = TIMESTAMP_DIR / f"{tsv.stem}.json"
-        if out_wav.exists() and out_json.exists() and not OVERWRITE:
-            print(f"⏭️  Skipping (exists): {out_wav}")
+        if out_audio.exists() and out_json.exists() and not OVERWRITE:
+            print(f"⏭️  Skipping (exists): {out_audio}")
             continue
 
         try:
